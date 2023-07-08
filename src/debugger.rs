@@ -1,39 +1,48 @@
-use std::borrow::BorrowMut;
+use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use bytes::{buf, Buf, BufMut, BytesMut};
-
-use std::convert::TryInto;
+//use async_mutex::Mutex;
+use futures::executor::block_on;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+//use tokio::net::TcpStream;
+use uuid::Uuid;
 
+use crate::buffer::Buffer;
+
+const VERSION_MAJOR: u32 = 1;
+const VERSION_MINOR: u32 = 0;
+const VERSION_PATCH: u32 = 0;
+
+#[derive(FromPrimitive, Debug, Clone)]
 pub enum Commands {
-    Status = 0x01,
+    None,
 
-    Poke8 = 0x02,
-    Poke16 = 0x03,
-    Poke32 = 0x04,
-    Poke64 = 0x05,
+    Attach,
+    Detach,
+    GetStatus,
 
-    Read = 0x06,
-    Write = 0x07,
-    Continue = 0x08,
-    Pause = 0x09,
-    Attach = 0x0A,
-    Detach = 0x0B,
-    QueryMemory = 0x0C,
-    QueryMemoryMulti = 0x0D,
-    CurrentPID = 0x0E,
-    AttachedPID = 0x0F,
-    GetPIDs = 0x10,
-    GetTitleID = 0x11,
-    Disconnect = 0x12,
-    ReadMulti = 0x13,
-    SetBreakpoint = 0x14,
+    QueryMemory,
+    QueryMemoryMulti,
+    ReadMemory,
+    WriteMemory,
+
+    Pause,
+    Resume,
+
+    GetCurrentPID,
+    GetAttachedPID,
+    GetTitleID,
+    GetPIDs,
+
+    SetBreakpoint,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Status {
     Stopped = 0x0,
     Running = 0x1,
@@ -134,59 +143,218 @@ impl std::fmt::Display for MemoryInfo {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PacketHeader {
+    pub command: Commands,
+    pub uuid: Uuid,
+    pub len: u32,
+}
+
+pub struct Packet {
+    pub header: PacketHeader,
+    pub data: Buffer,
+}
+
 pub struct Debugger {
     current_dump: PathBuf,
-    stream: Option<TcpStream>,
+
+    pending_responses: Arc<Vec<Uuid>>,
+    packet_map: Arc<Mutex<HashMap<Uuid, Packet>>>,
+    queue: Arc<Mutex<Vec<Packet>>>,
+
     protocol_version: u32,
     last_query: Box<Option<MemoryInfo>>,
+
+    pub connected: bool,
 }
 
 impl Debugger {
     pub fn new() -> Debugger {
         Debugger {
             current_dump: PathBuf::from(""),
-            stream: None,
+            pending_responses: Arc::new(Vec::new()),
+            packet_map: Arc::new(Mutex::new(HashMap::new())),
+            queue: Arc::new(Mutex::new(Vec::new())),
             protocol_version: 0,
             last_query: Box::new(None),
+            connected: false,
         }
     }
 
     pub async fn connect(&mut self, address: &str) -> Result<(), Box<dyn Error>> {
-        let stream = TcpStream::connect(address).await;
+        let stream = TcpStream::connect(address);
         if stream.is_err() {
             return Err(format!("Failed to connect to {}", address).into());
         }
 
-        self.stream = Some(stream.unwrap());
+        self.connected = true;
+
+        let stream = stream.unwrap();
+        let queue = Arc::clone(&self.queue);
+        let packet_map = Arc::clone(&self.packet_map);
+
+        thread::spawn(move || {
+            let mut stream = stream;
+
+            loop {
+                // process outgoing packets queue
+                let mut q = queue.lock().unwrap();
+
+                if q.len() > 0 {
+                    let packet = q.remove(0);
+
+                    let len = packet.data.len();
+                    let mut buffer = Buffer::new();
+                    buffer.write_u8(packet.header.command as u8);
+                    buffer.write_u128(packet.header.uuid.as_u128());
+                    buffer.write_u32(len as u32);
+                    buffer.write_buffer(&packet.data);
+
+                    let rc = stream.write_all(&buffer.buffer());
+                    if rc.is_err() {
+                        println!("Failed to write to the debugger: {:?}", rc);
+                        continue;
+                    }
+                }
+
+                drop(q);
+
+                let timeout = stream.read_timeout().unwrap();
+                let rc = stream.set_read_timeout(Some(std::time::Duration::from_millis(1000)));
+                if rc.is_err() {
+                    println!("Failed to set read timeout: {:?}", rc);
+                    continue;
+                }
+
+                let mut header_buffer = [0; 1 + 16 + 4];
+                let is_data_available = stream.read_exact(&mut header_buffer);
+
+                let rc = stream.set_read_timeout(timeout);
+                if rc.is_err() {
+                    println!("Failed to set read timeout: {:?}", rc);
+                    continue;
+                }
+
+                if is_data_available.is_ok() {
+                    let mut p_map = packet_map.lock().unwrap();
+                    // process incoming packets
+                    // let mut header_buffer = vec![0; 1 + 16 + 4];
+
+                    println!("Reading packet header... ({} bytes)", header_buffer.len());
+
+                    // stream.read_exact(&mut header_buffer).unwrap();
+
+                    /* let mut read = 0;
+                    while read < header_buffer.len() {
+                        let res = stream.read(&mut *header_buffer[read..len]);
+                        if res.is_err() {
+                            println!(
+                                "An error occured while reading the header from the debugger: {:?}",
+                                res
+                            );
+                            continue;
+                        }
+
+                        let r = res.unwrap();
+
+                        if r > 0 {
+                            println!("Read {} bytes", r);
+                        }
+
+                        read += r;
+                    }*/
+
+                    println!("Received packet: {:?}", header_buffer);
+
+                    let header = PacketHeader {
+                        command: num::FromPrimitive::from_u8(header_buffer[0]).unwrap(),
+                        uuid: Uuid::from_u128(u128::from_le_bytes(
+                            header_buffer[1..17].try_into().unwrap(),
+                        )),
+                        len: u32::from_le_bytes(header_buffer[17..21].try_into().unwrap()),
+                    };
+
+                    println!("Received packet header: {:?}", header);
+
+                    let mut data_buffer = vec![0; header.len as usize];
+                    let res = stream.read_exact(&mut data_buffer);
+                    if res.is_err() {
+                        println!(
+                            "An error occured while reading the data from the debugger: {:?}",
+                            res
+                        );
+                        continue;
+                    }
+
+                    println!("Received packet data: {:?}", data_buffer);
+
+                    let packet = Packet {
+                        header: header,
+                        data: Buffer::from(data_buffer),
+                    };
+
+                    p_map.insert(packet.header.uuid, packet);
+                    drop(p_map);
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
 
         Ok(())
     }
 
-    pub async fn get_status(&mut self) -> Result<Status, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
+    pub async fn send_command(&mut self, packet: Packet) -> Result<Packet, Box<dyn Error>> {
+        let start = std::time::Instant::now();
+
+        println!("Sending command: {:?}", packet.header.command);
+
+        let header = packet.header.clone();
+
+        println!("Acquiring queue lock...");
+        let mut queue = self.queue.lock().unwrap();
+        println!("Acquired queue lock...");
+        queue.push(packet);
+        println!("Pushed packet to queue");
+        drop(queue);
+
+        println!("Added packet to queue");
+
+        loop {
+            if start.elapsed().as_secs() > 30 {
+                return Err(format!("Command {:?} timed out!", header.command).into());
+            }
+
+            let mut packet_map = self.packet_map.lock().unwrap();
+            if packet_map.contains_key(&header.uuid) {
+                let p = packet_map.remove(&header.uuid).unwrap();
+                return Ok(p);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
 
-        let stream = self.stream.as_mut().unwrap();
+    pub async fn get_status(&mut self) -> Result<Status, Box<dyn Error>> {
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::GetStatus,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: Buffer::new(),
+            })
+            .await?;
 
-        let mut buffer = BytesMut::with_capacity(1);
-        buffer.put_u8(Commands::Status as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let status = stream.read_u8().await? as u32;
-        let major = stream.read_u8().await? as u32;
-        let minor = stream.read_u8().await? as u32;
-        let patch = stream.read_u8().await? as u32;
+        let status = packet.data.read_u8() as u32;
+        let major = packet.data.read_u8() as u32;
+        let minor = packet.data.read_u8() as u32;
+        let patch = packet.data.read_u8() as u32;
 
         self.protocol_version = (major << 16) | (minor << 8);
 
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to get status: {:?}", result).into());
-        }
-
-        if self.protocol_version > ((1 << 16) | (1 << 8)) {
+        if self.protocol_version > ((VERSION_MAJOR << 16) | (VERSION_MINOR << 8)) {
             return Err("Unsupported protocol version".into());
         }
 
@@ -228,182 +396,98 @@ impl Debugger {
     }
 
     pub async fn poke8(&mut self, addr: u64, value: u8) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(10);
-        buffer.put_u8(Commands::Poke8 as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u8(value);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to poke8: {:?}", result).into());
-        }
-
+        self.write_memory(addr, &[value]).await?;
         Ok(())
     }
 
     pub async fn peek8(&mut self, addr: u64) -> Result<u8, Box<dyn Error>> {
-        let mut buffer = self.read_memory(addr, 1).await?;
-        Ok(buffer.get_u8())
+        let buffer = self.read_memory(addr, 1).await?;
+        Ok(buffer[0])
     }
 
     pub async fn poke16(&mut self, addr: u64, value: u16) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(11);
-        buffer.put_u8(Commands::Poke16 as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u16_le(value);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to poke16: {:?}", result).into());
-        }
-
+        self.write_memory(addr, &value.to_le_bytes()).await?;
         Ok(())
     }
 
     pub async fn peek16(&mut self, addr: u64) -> Result<u16, Box<dyn Error>> {
-        let mut buffer = self.read_memory(addr, 2).await?;
-        Ok(buffer.get_u16())
+        let buffer = self.read_memory(addr, 2).await?;
+        Ok(u16::from_le_bytes(buffer.try_into().unwrap()))
     }
 
     pub async fn poke32(&mut self, addr: u64, value: u32) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(13);
-        buffer.put_u8(Commands::Poke32 as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u32_le(value);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to poke32: {:?}", result).into());
-        }
-
+        self.write_memory(addr, &value.to_le_bytes()).await?;
         Ok(())
     }
 
     pub async fn peek32(&mut self, addr: u64) -> Result<u32, Box<dyn Error>> {
-        let mut buffer = self.read_memory(addr, 4).await?;
-        Ok(buffer.get_u32_le())
+        let buffer = self.read_memory(addr, 4).await?;
+        Ok(u32::from_le_bytes(buffer.try_into().unwrap()))
     }
 
     pub async fn poke64(&mut self, addr: u64, value: u64) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(17);
-        buffer.put_u8(Commands::Poke64 as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u64_le(value);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to poke64: {:?}", result).into());
-        }
-
+        self.write_memory(addr, &value.to_le_bytes()).await?;
         Ok(())
     }
 
     pub async fn peek64(&mut self, addr: u64) -> Result<u64, Box<dyn Error>> {
-        let mut buffer = self.read_memory(addr, 8).await?;
-        Ok(buffer.get_u64_le())
+        let buffer = self.read_memory(addr, 8).await?;
+        Ok(u64::from_le_bytes(buffer.try_into().unwrap()))
     }
 
     pub async fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::WriteMemory,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new())
+                    .write_u64(addr)
+                    .write_compressed(data.to_vec())
+                    .clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(13);
-        buffer.put_u8(Commands::Write as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u32_le(data.len() as u32);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.success() {
-            let mut buffer = BytesMut::with_capacity(data.len());
-            buffer.put_slice(data);
-
-            stream.write_all(&buffer).await?;
-        } else {
-            let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-            return Err(format!("Failed to write memory: {:?}", result).into());
+        let rc = DebuggerResult::value_of(packet.data.read_u32());
+        if rc.failed() {
+            return Err(format!("Failed to write memory: {:?}", rc).into());
         }
 
         Ok(())
     }
 
-    pub async fn read_memory(&mut self, addr: u64, size: u32) -> Result<BytesMut, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+    pub async fn read_memory(&mut self, addr: u64, size: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::ReadMemory,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new()).write_u64(addr).write_u32(size).clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
+        let mut size = size;
+        let mut buffer = Vec::new();
 
-        let mut buffer = BytesMut::with_capacity(13);
-        buffer.put_u8(Commands::Read as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u32_le(size);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.success() {
-            let mut size = size;
-            let mut buffer = BytesMut::with_capacity(2048 * 4);
-
-            while size > 0 {
-                let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-                if result.failed() {
-                    stream.read_u32_le().await?;
-                    return Err(format!("Failed to read memory: {:?}", result).into());
-                }
-
-                let mut buffer2 = Vec::new();
-                let len = read_compressed(stream, &mut buffer2).await;
-
-                buffer.reserve(len as usize);
-                buffer.put_slice(&buffer2[0..(len as usize)]);
-
-                size -= len;
+        while size > 0 {
+            let rc = DebuggerResult::value_of(packet.data.read_u32());
+            if rc.failed() {
+                return Err(format!("Failed to read memory: {:?}", rc).into());
             }
 
-            stream.read_u32_le().await?;
-            Ok(buffer)
-        } else {
-            let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-            Err(format!("Failed to read memory: {:?}", result).into())
+            let mut len: u32 = 0;
+            let decompressed = packet.data.read_compressed(&mut len);
+
+            buffer.extend_from_slice(decompressed.buffer());
+
+            size -= len;
         }
+
+        Ok(buffer)
     }
 
     pub async fn set_breakpoint(
@@ -412,23 +496,24 @@ impl Debugger {
         flags: u64,
         addr: u64,
     ) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::SetBreakpoint,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new())
+                    .write_u32(id)
+                    .write_u64(flags)
+                    .write_u64(addr)
+                    .clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(21);
-        buffer.put_u8(Commands::SetBreakpoint as u8);
-        buffer.put_u32_le(id);
-        buffer.put_u64_le(addr);
-        buffer.put_u64_le(flags);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err(format!("Failed to set breakpoint: {:?}", result).into());
+        let rc = DebuggerResult::value_of(packet.data.read_u32());
+        if rc.failed() {
+            return Err(format!("Failed to set breakpoint: {:?}", rc).into());
         }
 
         Ok(())
@@ -479,23 +564,23 @@ impl Debugger {
     }
 
     async fn get_result(&mut self, cmd: Commands) -> Result<DebuggerResult, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: cmd,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: Buffer::new(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(1);
-        buffer.put_u8(cmd as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        Ok(result)
+        let rc = DebuggerResult::value_of(packet.data.read_u32());
+        Ok(rc)
     }
 
     pub async fn resume(&mut self) -> Result<DebuggerResult, Box<dyn Error>> {
-        self.get_result(Commands::Continue).await
+        self.get_result(Commands::Resume).await
     }
 
     pub async fn pause(&mut self) -> Result<DebuggerResult, Box<dyn Error>> {
@@ -503,19 +588,18 @@ impl Debugger {
     }
 
     pub async fn attach(&mut self, pid: u64) -> Result<DebuggerResult, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::Attach,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new()).write_u64(pid).clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(9);
-        buffer.put_u8(Commands::Attach as u8);
-        buffer.put_u64_le(pid);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
+        let result = DebuggerResult::value_of(packet.data.read_u32());
         Ok(result)
     }
 
@@ -535,19 +619,18 @@ impl Debugger {
             }
         }
 
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::QueryMemory,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new()).write_u64(addr).clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(9);
-        buffer.put_u8(Commands::QueryMemory as u8);
-        buffer.put_u64_le(addr);
-
-        stream.write_all(&buffer).await?;
-
-        let info = read_info(stream).await?;
+        let info = read_info(&mut packet.data).await?;
         self.last_query = Box::new(Some(info.clone()));
 
         Ok(info)
@@ -558,147 +641,114 @@ impl Debugger {
         addr: u64,
         max: u32,
     ) -> Result<Vec<MemoryInfo>, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(13);
-        buffer.put_u8(Commands::QueryMemoryMulti as u8);
-        buffer.put_u64_le(addr);
-        buffer.put_u32_le(max);
-
-        stream.write_all(&buffer).await?;
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::QueryMemoryMulti,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new()).write_u64(addr).write_u32(max).clone(),
+            })
+            .await?;
 
         let mut infos = Vec::new();
 
-        for i in 0..max {
-            let info = read_info(stream).await?;
+        for _ in 0..max {
+            let info = read_info(&mut packet.data).await?;
             infos.push(info.clone());
 
             if info.memory_type == MemoryType::Reserved {
                 break;
             }
         }
-
-        stream.read_u32_le().await?;
         Ok(infos)
     }
 
     pub async fn get_current_pid(&mut self) -> Result<u64, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::GetCurrentPID,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: Buffer::new(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(1);
-        buffer.put_u8(Commands::CurrentPID as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let mut pid = stream.read_u64_le().await?;
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
+        let result = DebuggerResult::value_of(packet.data.read_u32());
         if result.failed() {
-            pid = 0;
+            return Ok(0);
         }
 
+        let pid = packet.data.read_u64();
         Ok(pid)
     }
 
     pub async fn get_attached_pid(&mut self) -> Result<u64, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::GetAttachedPID,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: Buffer::new(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(1);
-        buffer.put_u8(Commands::AttachedPID as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let mut pid = stream.read_u64_le().await?;
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            pid = 0;
-        }
-
+        let pid = packet.data.read_u64();
         Ok(pid)
     }
 
     pub async fn get_pids(&mut self) -> Result<Vec<u64>, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::GetPIDs,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: Buffer::new(),
+            })
+            .await?;
+
+        let result = DebuggerResult::value_of(packet.data.read_u32());
+        if result.failed() {
+            return Err("Failed to get pids".into());
         }
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(1);
-        buffer.put_u8(Commands::GetPIDs as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let count = stream.read_u32_le().await?;
+        let count = packet.data.read_u32();
         let mut pids = Vec::new();
 
         for _ in 0..count {
-            let pid = stream.read_u64_le().await?;
+            let pid = packet.data.read_u64();
             pids.push(pid);
-        }
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err("Failed to get pids".into());
         }
 
         Ok(pids)
     }
 
     pub async fn get_title_id(&mut self, pid: u64) -> Result<u64, Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
+        let mut packet = self
+            .send_command(Packet {
+                header: PacketHeader {
+                    command: Commands::GetTitleID,
+                    uuid: Uuid::new_v4(),
+                    len: 0,
+                },
+                data: (&mut Buffer::new()).write_u64(pid).clone(),
+            })
+            .await?;
 
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(9);
-        buffer.put_u8(Commands::GetTitleID as u8);
-        buffer.put_u64_le(pid);
-
-        stream.write_all(&buffer).await?;
-
-        let mut title_id = stream.read_u64_le().await?;
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
+        let result = DebuggerResult::value_of(packet.data.read_u32());
         if result.failed() {
-            title_id = 0;
+            return Err("Failed to get title id".into());
         }
 
+        let title_id = packet.data.read_u64();
         Ok(title_id)
-    }
-
-    pub async fn disconnect(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.stream.is_some() {
-            return Err("Not connected to debugger".into());
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-
-        let mut buffer = BytesMut::with_capacity(8);
-        buffer.put_u8(Commands::Disconnect as u8);
-
-        stream.write_all(&buffer).await?;
-
-        let result = DebuggerResult::value_of(stream.read_u32_le().await?);
-        if result.failed() {
-            return Err("Failed to disconnect???".into());
-        }
-
-        self.stream.as_mut().unwrap().shutdown().await?;
-        self.stream = None;
-
-        Ok(())
     }
 
     pub async fn get_current_title_id(&mut self) -> Result<u64, Box<dyn Error>> {
@@ -714,51 +764,15 @@ impl Debugger {
         let pid = self.get_attached_pid().await?;
         Ok(pid != 0)
     }
-
-    pub fn connected(&mut self) -> bool {
-        self.stream.is_some()
-    }
 }
 
-async fn read_compressed(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> u32 {
-    let compressed_flag = stream.read_u8().await.unwrap();
-    let decompressed_len = stream.read_u32_le().await.unwrap();
+async fn read_info(buffer: &mut Buffer) -> Result<MemoryInfo, Box<dyn Error>> {
+    let addr = buffer.read_u64();
+    let size = buffer.read_u64();
+    let flags = buffer.read_u32();
+    let perm = buffer.read_u32();
 
-    if compressed_flag == 0 {
-        let mut vec = vec![0; decompressed_len as usize];
-        stream.read_exact(&mut vec).await.unwrap();
-
-        buffer.reserve(decompressed_len as usize);
-        buffer.append(&mut vec);
-    } else {
-        let compressed_len = stream.read_u32_le().await.unwrap();
-
-        let mut compressed_buffer = vec![0; compressed_len as usize];
-        stream.read_exact(&mut compressed_buffer).await.unwrap();
-
-        let mut pos = 0;
-        for i in (0..compressed_len).step_by(2) {
-            let value = compressed_buffer[i as usize];
-            let count = compressed_buffer[i as usize + 1] & 0xFF;
-
-            for j in (pos..pos + count) {
-                buffer.push(value);
-            }
-
-            pos += count;
-        }
-    }
-
-    decompressed_len
-}
-
-async fn read_info(stream: &mut TcpStream) -> Result<MemoryInfo, Box<dyn Error>> {
-    let addr = stream.read_u64_le().await.unwrap();
-    let size = stream.read_u64_le().await.unwrap();
-    let flags = stream.read_u32_le().await.unwrap();
-    let perm = stream.read_u32_le().await.unwrap();
-
-    let rc = DebuggerResult::value_of(stream.read_u32_le().await?);
+    let rc = DebuggerResult::value_of(buffer.read_u32());
     if rc.failed() {
         return Err(format!("Failed to read memory info: {:?}", rc).into());
     }

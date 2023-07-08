@@ -1,5 +1,5 @@
-# noexes-rs
-noexes-rs is a client for [Noexes](https://github.com/mdbell/Noexes) written in Rust.
+# rscm-rs
+rscm-rs is a client for [sys-rscm](https://github.com/RedBoxing/sys-rscm) written in Rust.
 
 ## Features
 - [x] Attach to a running process (including current process)
@@ -11,6 +11,7 @@ noexes-rs is a client for [Noexes](https://github.com/mdbell/Noexes) written in 
 - [x] Get Status
 - [x] Query memory regions
 - [ ] Search 
+- [ ] Pointer Search
 - [ ] Set breakpoints
 - [ ] View what accesses/writes to a memory address
 
@@ -21,12 +22,6 @@ noexes-rs is a client for [Noexes](https://github.com/mdbell/Noexes) written in 
 connect <ip>:<port>
 ```
 Connects to a Noexes server at the given ip and port. (Default port is 7331)
-
-### Disconnect
-```
-disconnect
-```
-Disconnects from the current server.
 
 ### Exit
 ```

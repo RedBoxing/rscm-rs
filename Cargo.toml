@@ -1,16 +1,19 @@
 [package]
-name = "noexes-rs"
+name = "rscm-rs"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-mutex = "1.4.0"
 bad64 = "0.6.0"
 bytemuck = "1.13.1"
 bytes = "1.4.0"
+futures = "0.3.28"
 num = "0.4.0"
 num-derive = "0.4.0"
 num-traits = "0.2.15"
 tempfile = "3.6.0"
 tokio = { version = "1.29.1", features = ["full"] }
+uuid = { version = "1.4.0", features = ["v4"] }

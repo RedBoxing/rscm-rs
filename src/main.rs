@@ -1,4 +1,4 @@
-use debugger::MemoryInfo;
+use debugger::{MemoryInfo, Status};
 
 use crate::debugger::MemoryType;
 
@@ -36,14 +36,6 @@ async fn main() {
                     println!("Connected to {}", args[0]);
                 }
             }
-            "disconnect" => {
-                if let Err(e) = debugger.disconnect().await {
-                    println!("Failed to disconnect: {}", e);
-                } else {
-                    println!("Disconnected");
-                }
-                println!("Disconnected");
-            }
             "status" => {
                 let status = debugger.get_status().await;
                 if status.is_err() {
@@ -51,6 +43,8 @@ async fn main() {
                     continue;
                 }
                 let status = status.unwrap();
+
+                println!("Got status");
 
                 let attached_pid = debugger.get_attached_pid().await;
                 if attached_pid.is_err() {
@@ -375,7 +369,15 @@ async fn main() {
         }
     }
 
-    if debugger.connected() {
-        debugger.disconnect().await.unwrap();
+    if debugger.connected {
+        let status = debugger.get_status().await;
+        if status.is_ok() && status.unwrap() == Status::Paused {
+            let rc = debugger.resume().await;
+            if let Err(e) = rc {
+                println!("Failed to resume: {}", e);
+            } else if rc.unwrap().failed() {
+                println!("Failed to resume");
+            }
+        }
     }
 }
