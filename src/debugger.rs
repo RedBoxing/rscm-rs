@@ -1,18 +1,20 @@
+mod buffer;
+mod dump;
+pub mod search;
+
+#[macro_use]
+pub mod utils;
+
+use crate::debugger::buffer::Buffer;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-//use async_mutex::Mutex;
-use futures::executor::block_on;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-//use tokio::net::TcpStream;
 use uuid::Uuid;
-
-use crate::buffer::Buffer;
 
 const VERSION_MAJOR: u32 = 1;
 const VERSION_MINOR: u32 = 0;
@@ -79,7 +81,7 @@ impl DebuggerResult {
     }
 }
 
-#[derive(FromPrimitive, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(FromPrimitive, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum MemoryType {
     Unmapped = 0x0,
     Io = 0x01,
@@ -105,7 +107,7 @@ pub enum MemoryType {
     CodeWritable = 0x15,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryInfo {
     pub addr: u64,
     pub size: u64,
@@ -156,8 +158,6 @@ pub struct Packet {
 }
 
 pub struct Debugger {
-    current_dump: PathBuf,
-
     pending_responses: Arc<Vec<Uuid>>,
     packet_map: Arc<Mutex<HashMap<Uuid, Packet>>>,
     queue: Arc<Mutex<Vec<Packet>>>,
@@ -171,7 +171,6 @@ pub struct Debugger {
 impl Debugger {
     pub fn new() -> Debugger {
         Debugger {
-            current_dump: PathBuf::from(""),
             pending_responses: Arc::new(Vec::new()),
             packet_map: Arc::new(Mutex::new(HashMap::new())),
             queue: Arc::new(Mutex::new(Vec::new())),
@@ -182,9 +181,15 @@ impl Debugger {
     }
 
     pub async fn connect(&mut self, address: &str) -> Result<(), Box<dyn Error>> {
-        let stream = TcpStream::connect(address);
-        if stream.is_err() {
-            return Err(format!("Failed to connect to {}", address).into());
+        let addr = if address.contains(":") {
+            address.to_string()
+        } else {
+            format!("{}:1337", address)
+        };
+
+        let stream = TcpStream::connect(addr);
+        if let Err(e) = stream {
+            return Err(format!("Failed to connect to {} : {}", address, e).into());
         }
 
         self.connected = true;
@@ -203,14 +208,13 @@ impl Debugger {
                 if q.len() > 0 {
                     let packet = q.remove(0);
 
-                    let len = packet.data.len();
                     let mut buffer = Buffer::new();
                     buffer.write_u8(packet.header.command as u8);
                     buffer.write_u128(packet.header.uuid.as_u128());
-                    buffer.write_u32(len as u32);
+                    buffer.write_u32(packet.data.len() as u32);
                     buffer.write_buffer(&packet.data);
 
-                    let rc = stream.write_all(&buffer.buffer());
+                    let rc = stream.write_all(buffer.buffer());
                     if rc.is_err() {
                         println!("Failed to write to the debugger: {:?}", rc);
                         continue;
@@ -237,34 +241,6 @@ impl Debugger {
 
                 if is_data_available.is_ok() {
                     let mut p_map = packet_map.lock().unwrap();
-                    // process incoming packets
-                    // let mut header_buffer = vec![0; 1 + 16 + 4];
-
-                    println!("Reading packet header... ({} bytes)", header_buffer.len());
-
-                    // stream.read_exact(&mut header_buffer).unwrap();
-
-                    /* let mut read = 0;
-                    while read < header_buffer.len() {
-                        let res = stream.read(&mut *header_buffer[read..len]);
-                        if res.is_err() {
-                            println!(
-                                "An error occured while reading the header from the debugger: {:?}",
-                                res
-                            );
-                            continue;
-                        }
-
-                        let r = res.unwrap();
-
-                        if r > 0 {
-                            println!("Read {} bytes", r);
-                        }
-
-                        read += r;
-                    }*/
-
-                    println!("Received packet: {:?}", header_buffer);
 
                     let header = PacketHeader {
                         command: num::FromPrimitive::from_u8(header_buffer[0]).unwrap(),
@@ -273,8 +249,6 @@ impl Debugger {
                         )),
                         len: u32::from_le_bytes(header_buffer[17..21].try_into().unwrap()),
                     };
-
-                    println!("Received packet header: {:?}", header);
 
                     let mut data_buffer = vec![0; header.len as usize];
                     let res = stream.read_exact(&mut data_buffer);
@@ -286,8 +260,6 @@ impl Debugger {
                         continue;
                     }
 
-                    println!("Received packet data: {:?}", data_buffer);
-
                     let packet = Packet {
                         header: header,
                         data: Buffer::from(data_buffer),
@@ -297,7 +269,7 @@ impl Debugger {
                     drop(p_map);
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });
 
@@ -306,32 +278,32 @@ impl Debugger {
 
     pub async fn send_command(&mut self, packet: Packet) -> Result<Packet, Box<dyn Error>> {
         let start = std::time::Instant::now();
-
-        println!("Sending command: {:?}", packet.header.command);
-
         let header = packet.header.clone();
 
-        println!("Acquiring queue lock...");
         let mut queue = self.queue.lock().unwrap();
-        println!("Acquired queue lock...");
         queue.push(packet);
-        println!("Pushed packet to queue");
         drop(queue);
 
-        println!("Added packet to queue");
-
         loop {
+            let mut packet_map = self.packet_map.lock().unwrap();
+
             if start.elapsed().as_secs() > 30 {
+                if packet_map.contains_key(&header.uuid) {
+                    packet_map.remove(&header.uuid).unwrap();
+                    drop(packet_map);
+                }
+
                 return Err(format!("Command {:?} timed out!", header.command).into());
             }
 
-            let mut packet_map = self.packet_map.lock().unwrap();
             if packet_map.contains_key(&header.uuid) {
                 let p = packet_map.remove(&header.uuid).unwrap();
                 return Ok(p);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            drop(packet_map);
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -355,7 +327,7 @@ impl Debugger {
         self.protocol_version = (major << 16) | (minor << 8);
 
         if self.protocol_version > ((VERSION_MAJOR << 16) | (VERSION_MINOR << 8)) {
-            return Err("Unsupported protocol version".into());
+            return Err("Failed to get status: Unsupported protocol version".into());
         }
 
         self.protocol_version |= patch;
@@ -364,7 +336,7 @@ impl Debugger {
             0x0 => Status::Stopped,
             0x1 => Status::Running,
             0x2 => Status::Paused,
-            _ => return Err("Unknown status".into()),
+            _ => return Err("Failed to get status: Unknown status".into()),
         };
 
         Ok(status)
@@ -381,7 +353,7 @@ impl Debugger {
             2 => self.poke16(addr, value as u16).await?,
             4 => self.poke32(addr, value as u32).await?,
             8 => self.poke64(addr, value).await?,
-            _ => return Err("Invalid data type".into()),
+            _ => return Err("Failed to poke memory: Invalid data type".into()),
         })
     }
 
@@ -391,7 +363,7 @@ impl Debugger {
             2 => self.peek16(addr).await? as u64,
             4 => self.peek32(addr).await? as u64,
             8 => self.peek64(addr).await?,
-            _ => return Err("Invalid data type".into()),
+            _ => return Err("Failed to peek memory: Invalid data type".into()),
         })
     }
 
@@ -563,11 +535,11 @@ impl Debugger {
         }
     }
 
-    async fn get_result(&mut self, cmd: Commands) -> Result<DebuggerResult, Box<dyn Error>> {
+    async fn get_result(&mut self, cmd: Commands) -> Result<(), Box<dyn Error>> {
         let mut packet = self
             .send_command(Packet {
                 header: PacketHeader {
-                    command: cmd,
+                    command: cmd.clone(),
                     uuid: Uuid::new_v4(),
                     len: 0,
                 },
@@ -576,18 +548,22 @@ impl Debugger {
             .await?;
 
         let rc = DebuggerResult::value_of(packet.data.read_u32());
-        Ok(rc)
+        if rc.failed() {
+            return Err(format!("Failed to execute {:?}: {:?}", cmd, rc).into());
+        }
+
+        Ok(())
     }
 
-    pub async fn resume(&mut self) -> Result<DebuggerResult, Box<dyn Error>> {
+    pub async fn resume(&mut self) -> Result<(), Box<dyn Error>> {
         self.get_result(Commands::Resume).await
     }
 
-    pub async fn pause(&mut self) -> Result<DebuggerResult, Box<dyn Error>> {
+    pub async fn pause(&mut self) -> Result<(), Box<dyn Error>> {
         self.get_result(Commands::Pause).await
     }
 
-    pub async fn attach(&mut self, pid: u64) -> Result<DebuggerResult, Box<dyn Error>> {
+    pub async fn attach(&mut self, pid: u64) -> Result<(), Box<dyn Error>> {
         let mut packet = self
             .send_command(Packet {
                 header: PacketHeader {
@@ -600,10 +576,14 @@ impl Debugger {
             .await?;
 
         let result = DebuggerResult::value_of(packet.data.read_u32());
-        Ok(result)
+        if result.failed() {
+            return Err(format!("Failed to attach to process {} : {:?}", pid, result).into());
+        }
+
+        Ok(())
     }
 
-    pub async fn detach(&mut self) -> Result<DebuggerResult, Box<dyn Error>> {
+    pub async fn detach(&mut self) -> Result<(), Box<dyn Error>> {
         self.get_result(Commands::Detach).await
     }
 
@@ -679,6 +659,7 @@ impl Debugger {
 
         let result = DebuggerResult::value_of(packet.data.read_u32());
         if result.failed() {
+            println!("Failed to get current pid: {:?}", result);
             return Ok(0);
         }
 
@@ -716,7 +697,7 @@ impl Debugger {
 
         let result = DebuggerResult::value_of(packet.data.read_u32());
         if result.failed() {
-            return Err("Failed to get pids".into());
+            return Err(format!("Failed to get pids : {:?}", result).into());
         }
 
         let count = packet.data.read_u32();
@@ -744,7 +725,7 @@ impl Debugger {
 
         let result = DebuggerResult::value_of(packet.data.read_u32());
         if result.failed() {
-            return Err("Failed to get title id".into());
+            return Err(format!("Failed to get title id : {:?}", result).into());
         }
 
         let title_id = packet.data.read_u64();

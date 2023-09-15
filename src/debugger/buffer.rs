@@ -152,22 +152,22 @@ impl Buffer {
     }
 
     pub fn write_u16(&mut self, data: u16) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_u32(&mut self, data: u32) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_u64(&mut self, data: u64) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_u128(&mut self, data: u128) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
@@ -177,27 +177,27 @@ impl Buffer {
     }
 
     pub fn write_i16(&mut self, data: i16) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_i32(&mut self, data: i32) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_i64(&mut self, data: i64) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_f32(&mut self, data: f32) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 
     pub fn write_f64(&mut self, data: f64) -> &mut Buffer {
-        self.write(self.pos, &data.to_be_bytes());
+        self.write(self.pos, &data.to_le_bytes());
         self
     }
 

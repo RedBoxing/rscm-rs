@@ -1,23 +1,29 @@
-use debugger::{MemoryInfo, Status};
+use std::sync::{Arc, Mutex};
 
-use crate::debugger::MemoryType;
+use debugger::{
+    search::{ConditionType, MemorySearcher, SearchType},
+    utils::{AnySizedNumber, DataType},
+    Status,
+};
+use predicates::prelude::predicate;
+
+use crate::debugger::{MemoryInfo, MemoryType};
 
 extern crate num;
 #[macro_use]
 extern crate num_derive;
-
-mod buffer;
-mod debugger;
-mod dump;
-mod search;
+#[macro_use]
+pub mod debugger;
 
 #[tokio::main]
 async fn main() {
-    let mut debugger = debugger::Debugger::new();
+    let debugger = Arc::new(Mutex::new(Box::new(debugger::Debugger::new())));
     let mut heap_start: u64 = 0;
     let mut heap_end: u64 = 0;
     let mut main_start: u64 = 0;
     let mut main_end: u64 = 0;
+
+    let mut searcher = MemorySearcher::new(debugger.clone());
 
     loop {
         let mut input = String::new();
@@ -30,51 +36,38 @@ async fn main() {
         match command {
             "exit" => break,
             "connect" => {
-                if let Err(e) = debugger.connect(args[0]).await {
-                    println!("Failed to connect: {}", e);
-                } else {
-                    println!("Connected to {}", args[0]);
-                }
+                get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .connect(args[0])
+                        .await
+                );
+                println!("Connected to {}", args[0]);
             }
             "status" => {
-                let status = debugger.get_status().await;
-                if status.is_err() {
-                    println!("{}", status.err().unwrap());
-                    continue;
-                }
-                let status = status.unwrap();
+                let mut debugger = debugger.lock().expect("Failed to lock debugger");
+                let status = get_result!(debugger.get_status().await);
 
-                println!("Got status");
+                let attached_pid = get_result!(debugger.get_attached_pid().await);
 
-                let attached_pid = debugger.get_attached_pid().await;
-                if attached_pid.is_err() {
-                    println!("{}", attached_pid.err().unwrap());
-                    continue;
-                }
-
-                let attached_pid = attached_pid.unwrap();
-
-                let attached_tid = debugger.get_title_id(attached_pid).await;
-                if attached_tid.is_err() {
-                    println!("{}", attached_tid.err().unwrap());
-                    continue;
-                }
+                let attached_tid = if attached_pid != 0 {
+                    get_result!(debugger.get_title_id(attached_pid).await)
+                } else {
+                    0
+                };
 
                 println!("---- Status ----");
                 println!("Attached PID: {}", attached_pid);
-                println!("Attached Title ID: {:#x}", attached_tid.unwrap());
+                println!("Attached Title ID: {:#x}", attached_tid);
                 println!("Status: {:?}", status);
                 println!("Main: {:#x} - {:#x}", main_start, main_end);
                 println!("Heap: {:#x} - {:#x}", heap_start, heap_end);
                 println!("----------------");
             }
             "get_pids" => {
-                let pids = debugger.get_pids().await;
-                if pids.is_err() {
-                    println!("Failed to get PIDs");
-                    continue;
-                }
-                let pids = pids.unwrap();
+                let mut debugger = debugger.lock().expect("Failed to lock debugger");
+                let pids = get_result!(debugger.get_pids().await);
 
                 println!("PIDs:");
                 for pid in pids {
@@ -88,140 +81,126 @@ async fn main() {
                 }
             }
             "get_current_pid" => {
-                let pid = debugger.get_current_pid().await;
-                if pid.is_err() {
-                    println!("Failed to get current PID");
-                    continue;
-                }
-                let pid = pid.unwrap();
-
+                let pid = get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .get_current_pid()
+                        .await
+                );
                 println!("Current PID: {}", pid);
             }
             "get_current_title_id" => {
-                let title_id = debugger.get_current_title_id().await;
-                if title_id.is_err() {
-                    println!("Failed to get current title ID");
-                    continue;
-                }
-                let title_id = title_id.unwrap();
-
+                let title_id = get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .get_current_title_id()
+                        .await
+                );
                 println!("Current title ID: {:#16x}", title_id);
             }
             "get_attached_pid" => {
-                let pid = debugger.get_attached_pid().await;
-                if pid.is_err() {
-                    println!("Failed to get attached PID");
-                    continue;
-                }
-                let pid = pid.unwrap();
-
+                let pid = get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .get_attached_pid()
+                        .await
+                );
                 println!("Attached PID: {}", pid);
             }
             "attach" => {
+                let mut debugger = debugger.lock().expect("Failed to lock debugger");
                 let pid = args[0].parse::<u64>().unwrap();
-                if let Err(e) = debugger.attach(pid).await {
-                    println!("Failed to attach: {}", e);
-                } else {
-                    println!("Attached to {}", pid);
-                    println!("Getting memory regions...");
-                    let res = debugger.query_multi(0, 10000).await;
-                    if res.is_err() {
-                        println!("Failed to query: {}", res.err().unwrap());
-                        continue;
-                    }
-                    let meminfos = res.unwrap();
+                get_result!(debugger.attach(pid).await);
 
-                    println!("Found {} memory regions", meminfos.len());
+                println!("Attached to {}", pid);
+                println!("Getting memory regions...");
+                let meminfos = get_result!(debugger.query_multi(0, 10000).await);
 
-                    let mut m_count = 0;
-                    for meminfo in meminfos.iter() {
-                        if meminfo.memory_type == MemoryType::CodeStatic && meminfo.perm == 0x5 {
-                            m_count += 1;
-                            if m_count == 2 {
-                                main_start = meminfo.addr;
-                            } else if m_count == 3 {
-                                main_end = meminfo.addr;
-                            }
+                println!("Found {} memory regions", meminfos.len());
+
+                let mut m_count = 0;
+                for meminfo in meminfos.iter() {
+                    if meminfo.memory_type == MemoryType::CodeStatic && meminfo.perm == 0x5 {
+                        m_count += 1;
+                        if m_count == 2 {
+                            main_start = meminfo.addr;
+                        } else if m_count == 3 {
+                            main_end = meminfo.addr;
                         }
                     }
-
-                    let heaps: Vec<MemoryInfo> = meminfos
-                        .iter()
-                        .filter(|x| x.memory_type == debugger::MemoryType::Heap)
-                        .cloned()
-                        .collect();
-
-                    heap_start = heaps.first().unwrap().addr;
-                    heap_end = heaps.last().unwrap().addr + heaps.last().unwrap().size;
-
-                    println!("Done!");
                 }
+
+                let heaps: Vec<MemoryInfo> = meminfos
+                    .iter()
+                    .filter(|x| x.memory_type == debugger::MemoryType::Heap)
+                    .cloned()
+                    .collect();
+
+                heap_start = heaps.first().unwrap().addr;
+                heap_end = heaps.last().unwrap().addr + heaps.last().unwrap().size;
+
+                println!("Done!");
             }
             "attach_current" => {
-                let pid = debugger.get_current_pid().await;
-                if pid.is_err() {
-                    println!("Failed to get current PID");
+                let mut debugger = debugger.lock().expect("Failed to lock debugger");
+                let pid = get_result!(debugger.get_current_pid().await);
+                if pid == 0 {
+                    println!("No PID found");
                     continue;
                 }
 
-                let pid = pid.unwrap();
-                if let Err(e) = debugger.attach(pid).await {
-                    println!("Failed to attach: {}", e);
-                } else {
-                    println!("Attached to {}", pid);
-                    println!("Getting memory regions...");
-                    let res = debugger.query_multi(0, 10000).await;
-                    if res.is_err() {
-                        println!("Failed to query: {}", res.err().unwrap());
-                        continue;
-                    }
-                    let meminfos = res.unwrap();
+                get_result!(debugger.attach(pid).await);
 
-                    println!("Found {} memory regions", meminfos.len());
+                println!("Attached to {}", pid);
+                println!("Getting memory regions...");
+                let meminfos = get_result!(debugger.query_multi(0, 10000).await);
+                println!("Found {} memory regions", meminfos.len());
 
-                    let mut m_count = 0;
-                    for meminfo in meminfos.iter() {
-                        if meminfo.memory_type == MemoryType::CodeStatic && meminfo.perm == 0x5 {
-                            m_count += 1;
-                            if m_count == 2 {
-                                main_start = meminfo.addr;
-                            } else if m_count == 3 {
-                                main_end = meminfo.addr;
-                            }
+                let mut m_count = 0;
+                for meminfo in meminfos.iter() {
+                    if meminfo.memory_type == MemoryType::CodeStatic && meminfo.perm == 0x5 {
+                        m_count += 1;
+                        if m_count == 2 {
+                            main_start = meminfo.addr;
+                        } else if m_count == 3 {
+                            main_end = meminfo.addr;
                         }
                     }
-
-                    let heaps: Vec<MemoryInfo> = meminfos
-                        .iter()
-                        .filter(|x| x.memory_type == debugger::MemoryType::Heap)
-                        .cloned()
-                        .collect();
-
-                    heap_start = heaps.first().unwrap().addr;
-                    heap_end = heaps.last().unwrap().addr + heaps.last().unwrap().size;
-
-                    println!("Done!");
                 }
+
+                let heaps: Vec<MemoryInfo> = meminfos
+                    .iter()
+                    .filter(|x| x.memory_type == debugger::MemoryType::Heap)
+                    .cloned()
+                    .collect();
+
+                heap_start = heaps.first().unwrap().addr;
+                heap_end = heaps.last().unwrap().addr + heaps.last().unwrap().size;
+
+                println!("Done!");
             }
             "pause" => {
-                let res = debugger.pause().await;
-                if let Err(e) = res {
-                    println!("Failed to pause: {}", e);
-                } else if res.unwrap().failed() {
-                    println!("Failed to pause");
-                } else {
-                    println!("Paused");
-                }
+                get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .pause()
+                        .await
+                );
+                println!("Paused");
             }
             "resume" => {
-                let res = debugger.resume().await;
-                if let Err(e) = res {
-                    println!("Failed to resume: {}", e);
-                } else if res.unwrap().failed() {
-                    println!("Failed to resume");
-                } else {
-                    println!("Resumed");
-                }
+                get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .resume()
+                        .await
+                );
+                println!("Resumed");
             }
             "query" => {
                 let addr = u64::from_str_radix(args[0].trim_start_matches("0x"), 16);
@@ -229,14 +208,18 @@ async fn main() {
                     println!("Invalid address: {}", args[0]);
                     continue;
                 }
-                let res = debugger.query(addr.unwrap()).await;
-                if let Err(e) = res {
-                    println!("Failed to query: {}", e);
-                } else {
-                    println!("{}", res.unwrap());
-                }
+
+                let res = get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .query(addr.unwrap())
+                        .await
+                );
+                println!("{}", res);
             }
             "peek" => {
+                let mut debugger = debugger.lock().expect("Failed to lock debugger");
                 let addr = u64::from_str_radix(args[0].trim_start_matches("0x"), 16);
                 let size = if args[1].starts_with("0x") {
                     u64::from_str_radix(args[1].trim_start_matches("0x"), 16)
@@ -258,25 +241,17 @@ async fn main() {
                 let size = size.unwrap();
 
                 let data: Vec<u8> = if size == 1 || size == 2 || size == 4 || size == 8 {
-                    let res = debugger.peek(size as u8, address).await;
-                    if let Err(e) = res {
-                        println!("Failed to peek: {}", e);
-                        continue;
-                    }
+                    let res = get_result!(debugger.peek(size as u8, address).await);
                     match size {
-                        1 => (res.unwrap() as u8).to_le_bytes().to_vec(),
-                        2 => (res.unwrap() as u16).to_le_bytes().to_vec(),
-                        4 => (res.unwrap() as u32).to_le_bytes().to_vec(),
-                        8 => res.unwrap().to_le_bytes().to_vec(),
+                        1 => (res as u8).to_le_bytes().to_vec(),
+                        2 => (res as u16).to_le_bytes().to_vec(),
+                        4 => (res as u32).to_le_bytes().to_vec(),
+                        8 => res.to_le_bytes().to_vec(),
                         _ => unreachable!(),
                     }
                 } else {
-                    let res = debugger.read_memory(address, size as u32).await;
-                    if let Err(e) = res {
-                        println!("Failed to read memory: {}", e);
-                        continue;
-                    }
-                    res.unwrap().to_vec()
+                    let res = get_result!(debugger.read_memory(address, size as u32).await);
+                    res
                 };
 
                 let data: &[u32] = unsafe {
@@ -333,32 +308,270 @@ async fn main() {
                 let size = size.unwrap();
                 let bytes = bytes.unwrap();
 
-                let res = debugger.poke(size, address, bytes).await;
-                if let Err(e) = res {
-                    println!("Failed to poke: {}", e);
-                } else {
-                    println!("Wrote {} bytes to {:#x}", size, address);
-                }
+                let res = get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .poke(size, address, bytes)
+                        .await
+                );
+                println!("Wrote {} bytes to {:#x}", size, address);
             }
             "search" => match args[0] {
                 "help" => {
                     println!("Usage: start_search <region> <type>");
                 }
                 "start" => {
-                    let region = args[0].parse::<u64>().unwrap(); // 0 = heap, 1 = main, 2 = heap+main
-                    let search_type = args[1].parse::<u64>().unwrap(); // 0 = u8, 1 = u16, 2 = u32, 3 = u64, 4 = f32, 5 = f64
-                    let condition = args[2].parse::<u64>().unwrap(); // 0 = unknown, 1 = equal, 2 = not equal, 3 = greater than, 4 = less than, 5 = greater than or equal, 6 = less than or equal
-                    let value = args[3].parse::<u64>().unwrap();
+                    let region = args[1].parse::<u64>().unwrap(); // 0 = heap, 1 = main, 2 = heap+main
+                    let data_type = args[2].parse::<u64>().unwrap();
+                    let search_type = args[3].parse::<u64>().unwrap(); // 0 = u8, 1 = u16, 2 = u32, 3 = u64, 4 = f32, 5 = f64
+                    let condition = args[4].parse::<u64>().unwrap(); // 0 = unknown, 1 = equal, 2 = not equal, 3 = greater than, 4 = less than, 5 = greater than or equal, 6 = less than or equal
 
-                    let mut start: u64 = 0;
-                    let mut end: u64 = 0;
+                    match search_type {
+                        0 => searcher.search_type = SearchType::Unknown,
+                        1 => searcher.search_type = SearchType::Previous,
+                        2 => searcher.search_type = SearchType::Known,
+                        3 => searcher.search_type = SearchType::Different,
+                        _ => {
+                            println!("Unknown search type: {}", search_type);
+                            continue;
+                        }
+                    }
 
-                    if region == 0 {
-                        start = heap_start;
-                        end = heap_end;
-                    } else if region == 1 {
-                        start = main_start;
-                        end = main_end;
+                    match data_type {
+                        0 => {
+                            searcher.data_type = DataType::UnsignedByte;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_u8(
+                                    args[5].parse::<u8>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        1 => {
+                            searcher.data_type = DataType::Byte;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_i8(
+                                    args[5].parse::<i8>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        2 => {
+                            searcher.data_type = DataType::UnsignedShort;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_u16(
+                                    args[5].parse::<u16>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        3 => {
+                            searcher.data_type = DataType::Short;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_i16(
+                                    args[5].parse::<i16>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        4 => {
+                            searcher.data_type = DataType::UnsignedInt;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_u32(
+                                    args[5].parse::<u32>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        5 => {
+                            searcher.data_type = DataType::Int;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_i32(
+                                    args[5].parse::<i32>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        6 => {
+                            searcher.data_type = DataType::UnsignedLong;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_u64(
+                                    args[5].parse::<u64>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        7 => {
+                            searcher.data_type = DataType::Long;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_i64(
+                                    args[5].parse::<i64>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        8 => {
+                            searcher.data_type = DataType::Float;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_f32(
+                                    args[5].parse::<f32>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        9 => {
+                            searcher.data_type = DataType::Double;
+                            if searcher.search_type == SearchType::Known {
+                                searcher.know_value = AnySizedNumber::from_f64(
+                                    args[5].parse::<f64>().expect("Failed to parse value"),
+                                );
+                            }
+                        }
+                        _ => {
+                            println!("Unknown data type: {}", data_type);
+                            continue;
+                        }
+                    }
+
+                    match condition {
+                        0 => searcher.condition_type = ConditionType::Equals,
+                        1 => searcher.condition_type = ConditionType::NotEquals,
+                        2 => searcher.condition_type = ConditionType::LessThan,
+                        3 => searcher.condition_type = ConditionType::LessThanOrEquals,
+                        4 => searcher.condition_type = ConditionType::GreaterThan,
+                        5 => searcher.condition_type = ConditionType::GreaterThanOrEquals,
+                        _ => {
+                            println!("Unknown condition type: {}", condition);
+                            continue;
+                        }
+                    }
+
+                    let result = searcher
+                        .start_search(predicate::function(
+                            move |&info: &MemoryInfo| match region {
+                                0 => (info.perm & 0x1) != 0 && info.memory_type == MemoryType::Heap,
+                                1 => {
+                                    (info.perm & 0x4) != 0
+                                        && info.addr >= main_start
+                                        && (info.addr + info.size) <= main_end
+                                }
+                                2 => {
+                                    ((info.perm & 0x1) != 0 && info.memory_type == MemoryType::Heap)
+                                        || ((info.perm & 0x4) != 0
+                                            && info.addr >= main_start
+                                            && (info.addr + info.size) <= main_end)
+                                }
+                                _ => {
+                                    print!("Unknown region: {}", region);
+                                    false
+                                }
+                            },
+                        ))
+                        .await;
+
+                    if let Some(res) = result {
+                        println!("Found {} results", res.addresses.len());
+
+                        if res.addresses.len() < 20 {
+                            for (addr, value) in res.addresses.iter() {
+                                println!("{:#x} => {}", addr, value);
+                            }
+                        }
+                    } else {
+                        println!("Failed to start search");
+                    }
+                }
+                "continue" => {
+                    let search_type = args[1].parse::<u64>().unwrap();
+                    let condition = args[2].parse::<u64>().unwrap();
+
+                    match search_type {
+                        0 => searcher.search_type = SearchType::Unknown,
+                        1 => searcher.search_type = SearchType::Previous,
+                        2 => searcher.search_type = SearchType::Known,
+                        3 => searcher.search_type = SearchType::Different,
+                        _ => {
+                            println!("Unknown search type: {}", search_type);
+                            continue;
+                        }
+                    }
+
+                    if searcher.search_type == SearchType::Known {
+                        match searcher.data_type {
+                            DataType::UnsignedByte => {
+                                searcher.know_value = AnySizedNumber::from_u8(
+                                    args[3].parse::<u8>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Byte => {
+                                searcher.know_value = AnySizedNumber::from_i8(
+                                    args[3].parse::<i8>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::UnsignedShort => {
+                                searcher.know_value = AnySizedNumber::from_u16(
+                                    args[3].parse::<u16>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Short => {
+                                searcher.know_value = AnySizedNumber::from_i16(
+                                    args[3].parse::<i16>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::UnsignedInt => {
+                                searcher.know_value = AnySizedNumber::from_u32(
+                                    args[3].parse::<u32>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Int => {
+                                searcher.know_value = AnySizedNumber::from_i32(
+                                    args[3].parse::<i32>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::UnsignedLong => {
+                                searcher.know_value = AnySizedNumber::from_u64(
+                                    args[3].parse::<u64>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Long => {
+                                searcher.know_value = AnySizedNumber::from_i64(
+                                    args[3].parse::<i64>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Float => {
+                                searcher.know_value = AnySizedNumber::from_f32(
+                                    args[3].parse::<f32>().expect("Failed to parse value"),
+                                );
+                            }
+                            DataType::Double => {
+                                searcher.know_value = AnySizedNumber::from_f64(
+                                    args[3].parse::<f64>().expect("Failed to parse value"),
+                                );
+                            }
+                            _ => {
+                                println!("Unknown data type: {}", searcher.data_type);
+                                continue;
+                            }
+                        }
+                    }
+
+                    match condition {
+                        0 => searcher.condition_type = ConditionType::Equals,
+                        1 => searcher.condition_type = ConditionType::NotEquals,
+                        2 => searcher.condition_type = ConditionType::LessThan,
+                        3 => searcher.condition_type = ConditionType::LessThanOrEquals,
+                        4 => searcher.condition_type = ConditionType::GreaterThan,
+                        5 => searcher.condition_type = ConditionType::GreaterThanOrEquals,
+                        _ => {
+                            println!("Unknown condition type: {}", condition);
+                            continue;
+                        }
+                    }
+
+                    let result = searcher.continue_search().await;
+
+                    if let Some(res) = result {
+                        println!("Found {} results", res.addresses.len());
+
+                        if res.addresses.len() < 20 {
+                            for (addr, value) in res.addresses.iter() {
+                                println!("{:#x} => {}", addr, value);
+                            }
+                        }
+                    } else {
+                        println!("Failed to start search");
                     }
                 }
                 _ => {
@@ -369,15 +582,11 @@ async fn main() {
         }
     }
 
+    let mut debugger = debugger.lock().expect("Failed to lock debugger");
     if debugger.connected {
-        let status = debugger.get_status().await;
-        if status.is_ok() && status.unwrap() == Status::Paused {
-            let rc = debugger.resume().await;
-            if let Err(e) = rc {
-                println!("Failed to resume: {}", e);
-            } else if rc.unwrap().failed() {
-                println!("Failed to resume");
-            }
+        let status = get_result!(debugger.get_status().await);
+        if status == Status::Paused {
+            get_result!(debugger.resume().await);
         }
     }
 }
