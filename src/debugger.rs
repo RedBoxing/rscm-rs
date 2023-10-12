@@ -215,7 +215,7 @@ impl<T: PacketHandler + Send + 'static> Debugger<T> {
         let packet_map = Arc::clone(&self.packet_map);
         let handler = self.handler.clone();
 
-        thread::spawn(move || {
+        tokio::spawn(async move {
             let mut stream = stream;
 
             loop {
