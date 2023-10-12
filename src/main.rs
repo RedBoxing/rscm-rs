@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use debugger::{
-    search::{ConditionType, MemorySearcher, SearchType},
+    search::{ConditionType, SearchType},
     utils::{AnySizedNumber, DataType},
-    Status,
+    Commands, Packet, PacketHandler, Status,
 };
 use predicates::prelude::predicate;
 
@@ -15,9 +16,37 @@ extern crate num_derive;
 #[macro_use]
 pub mod debugger;
 
+struct MyPacketHandler {}
+
+#[async_trait]
+impl PacketHandler for MyPacketHandler {
+    async fn handle(s: Arc<Mutex<Self>>, packet: &mut Packet) {
+        println!("Packet: {:?}", packet.header);
+
+        match packet.header.command {
+            Commands::Log => {
+                let len = packet.data.read_u32() as usize;
+                let s = packet.data.read_string(len);
+
+                println!("[DEBUG] {}", s);
+            }
+            _ => {}
+        }
+    }
+}
+
+type Debugger = debugger::Debugger<MyPacketHandler>;
+type MemorySearcher = debugger::search::MemorySearcher<MyPacketHandler>;
+
 #[tokio::main]
 async fn main() {
-    let debugger = Arc::new(Mutex::new(Box::new(debugger::Debugger::new())));
+    let debugger = Arc::new(Mutex::new(Debugger::new()));
+
+    {
+        let mut debugger = debugger.lock().expect("Failed to lock debugger");
+        debugger.set_packet_handler(Arc::new(Mutex::new(MyPacketHandler {})));
+    }
+
     let mut heap_start: u64 = 0;
     let mut heap_end: u64 = 0;
     let mut main_start: u64 = 0;
@@ -29,18 +58,21 @@ async fn main() {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
 
-        let args = input.split_whitespace().collect::<Vec<_>>();
-        let command = args[0];
-        let args = &args[1..];
+        let args = input
+            .split_whitespace()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let command = args[0].clone();
+        let args = args[1..].to_vec();
 
-        match command {
+        match command.as_str() {
             "exit" => break,
             "connect" => {
                 get_result!(
                     debugger
                         .lock()
                         .expect("Failed to lock debugger")
-                        .connect(args[0])
+                        .connect(args[0].as_str())
                         .await
                 );
                 println!("Connected to {}", args[0]);
@@ -182,6 +214,16 @@ async fn main() {
 
                 println!("Done!");
             }
+            "detach" => {
+                get_result!(
+                    debugger
+                        .lock()
+                        .expect("Failed to lock debugger")
+                        .detach()
+                        .await
+                );
+                println!("Detached");
+            }
             "pause" => {
                 get_result!(
                     debugger
@@ -317,21 +359,21 @@ async fn main() {
                 );
                 println!("Wrote {} bytes to {:#x}", size, address);
             }
-            "search" => match args[0] {
+            "search" => match args[0].as_str() {
                 "help" => {
                     println!("Usage: start_search <region> <type>");
                 }
                 "start" => {
-                    let region = args[1].parse::<u64>().unwrap(); // 0 = heap, 1 = main, 2 = heap+main
-                    let data_type = args[2].parse::<u64>().unwrap();
-                    let search_type = args[3].parse::<u64>().unwrap(); // 0 = u8, 1 = u16, 2 = u32, 3 = u64, 4 = f32, 5 = f64
-                    let condition = args[4].parse::<u64>().unwrap(); // 0 = unknown, 1 = equal, 2 = not equal, 3 = greater than, 4 = less than, 5 = greater than or equal, 6 = less than or equal
+                    let region = args[1].clone();
+                    let data_type = args[2].as_str();
+                    let search_type = args[3].as_str();
+                    let condition = args[4].as_str();
 
                     match search_type {
-                        0 => searcher.search_type = SearchType::Unknown,
-                        1 => searcher.search_type = SearchType::Previous,
-                        2 => searcher.search_type = SearchType::Known,
-                        3 => searcher.search_type = SearchType::Different,
+                        "unk" => searcher.search_type = SearchType::Unknown,
+                        "prev" => searcher.search_type = SearchType::Previous,
+                        "know" => searcher.search_type = SearchType::Known,
+                        "diff" => searcher.search_type = SearchType::Different,
                         _ => {
                             println!("Unknown search type: {}", search_type);
                             continue;
@@ -339,7 +381,7 @@ async fn main() {
                     }
 
                     match data_type {
-                        0 => {
+                        "u8" => {
                             searcher.data_type = DataType::UnsignedByte;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_u8(
@@ -347,7 +389,7 @@ async fn main() {
                                 );
                             }
                         }
-                        1 => {
+                        "i8" => {
                             searcher.data_type = DataType::Byte;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_i8(
@@ -355,7 +397,7 @@ async fn main() {
                                 );
                             }
                         }
-                        2 => {
+                        "u16" => {
                             searcher.data_type = DataType::UnsignedShort;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_u16(
@@ -363,7 +405,7 @@ async fn main() {
                                 );
                             }
                         }
-                        3 => {
+                        "i16" => {
                             searcher.data_type = DataType::Short;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_i16(
@@ -371,7 +413,7 @@ async fn main() {
                                 );
                             }
                         }
-                        4 => {
+                        "u32" => {
                             searcher.data_type = DataType::UnsignedInt;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_u32(
@@ -379,7 +421,7 @@ async fn main() {
                                 );
                             }
                         }
-                        5 => {
+                        "i32" => {
                             searcher.data_type = DataType::Int;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_i32(
@@ -387,7 +429,7 @@ async fn main() {
                                 );
                             }
                         }
-                        6 => {
+                        "u64" => {
                             searcher.data_type = DataType::UnsignedLong;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_u64(
@@ -395,7 +437,7 @@ async fn main() {
                                 );
                             }
                         }
-                        7 => {
+                        "i64" => {
                             searcher.data_type = DataType::Long;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_i64(
@@ -403,7 +445,7 @@ async fn main() {
                                 );
                             }
                         }
-                        8 => {
+                        "f32" => {
                             searcher.data_type = DataType::Float;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_f32(
@@ -411,7 +453,7 @@ async fn main() {
                                 );
                             }
                         }
-                        9 => {
+                        "f64" => {
                             searcher.data_type = DataType::Double;
                             if searcher.search_type == SearchType::Known {
                                 searcher.know_value = AnySizedNumber::from_f64(
@@ -426,12 +468,12 @@ async fn main() {
                     }
 
                     match condition {
-                        0 => searcher.condition_type = ConditionType::Equals,
-                        1 => searcher.condition_type = ConditionType::NotEquals,
-                        2 => searcher.condition_type = ConditionType::LessThan,
-                        3 => searcher.condition_type = ConditionType::LessThanOrEquals,
-                        4 => searcher.condition_type = ConditionType::GreaterThan,
-                        5 => searcher.condition_type = ConditionType::GreaterThanOrEquals,
+                        "==" => searcher.condition_type = ConditionType::Equals,
+                        "!=" => searcher.condition_type = ConditionType::NotEquals,
+                        "<" => searcher.condition_type = ConditionType::LessThan,
+                        "<=" => searcher.condition_type = ConditionType::LessThanOrEquals,
+                        ">" => searcher.condition_type = ConditionType::GreaterThan,
+                        ">=" => searcher.condition_type = ConditionType::GreaterThanOrEquals,
                         _ => {
                             println!("Unknown condition type: {}", condition);
                             continue;
@@ -439,15 +481,17 @@ async fn main() {
                     }
 
                     let result = searcher
-                        .start_search(predicate::function(
-                            move |&info: &MemoryInfo| match region {
-                                0 => (info.perm & 0x1) != 0 && info.memory_type == MemoryType::Heap,
-                                1 => {
+                        .start_search(predicate::function(Box::new(move |&info: &MemoryInfo| {
+                            match region.as_str() {
+                                "heap" => {
+                                    (info.perm & 0x1) != 0 && info.memory_type == MemoryType::Heap
+                                }
+                                "main" => {
                                     (info.perm & 0x4) != 0
                                         && info.addr >= main_start
                                         && (info.addr + info.size) <= main_end
                                 }
-                                2 => {
+                                "heap+main" => {
                                     ((info.perm & 0x1) != 0 && info.memory_type == MemoryType::Heap)
                                         || ((info.perm & 0x4) != 0
                                             && info.addr >= main_start
@@ -457,8 +501,8 @@ async fn main() {
                                     print!("Unknown region: {}", region);
                                     false
                                 }
-                            },
-                        ))
+                            }
+                        })))
                         .await;
 
                     if let Some(res) = result {
@@ -474,14 +518,14 @@ async fn main() {
                     }
                 }
                 "continue" => {
-                    let search_type = args[1].parse::<u64>().unwrap();
-                    let condition = args[2].parse::<u64>().unwrap();
+                    let search_type = args[1].as_str();
+                    let condition = args[2].as_str();
 
                     match search_type {
-                        0 => searcher.search_type = SearchType::Unknown,
-                        1 => searcher.search_type = SearchType::Previous,
-                        2 => searcher.search_type = SearchType::Known,
-                        3 => searcher.search_type = SearchType::Different,
+                        "know" => searcher.search_type = SearchType::Unknown,
+                        "prev" => searcher.search_type = SearchType::Previous,
+                        "know" => searcher.search_type = SearchType::Known,
+                        "diff" => searcher.search_type = SearchType::Different,
                         _ => {
                             println!("Unknown search type: {}", search_type);
                             continue;
@@ -548,12 +592,12 @@ async fn main() {
                     }
 
                     match condition {
-                        0 => searcher.condition_type = ConditionType::Equals,
-                        1 => searcher.condition_type = ConditionType::NotEquals,
-                        2 => searcher.condition_type = ConditionType::LessThan,
-                        3 => searcher.condition_type = ConditionType::LessThanOrEquals,
-                        4 => searcher.condition_type = ConditionType::GreaterThan,
-                        5 => searcher.condition_type = ConditionType::GreaterThanOrEquals,
+                        "==" => searcher.condition_type = ConditionType::Equals,
+                        "!=" => searcher.condition_type = ConditionType::NotEquals,
+                        "<" => searcher.condition_type = ConditionType::LessThan,
+                        "<=" => searcher.condition_type = ConditionType::LessThanOrEquals,
+                        ">" => searcher.condition_type = ConditionType::GreaterThan,
+                        ">=" => searcher.condition_type = ConditionType::GreaterThanOrEquals,
                         _ => {
                             println!("Unknown condition type: {}", condition);
                             continue;

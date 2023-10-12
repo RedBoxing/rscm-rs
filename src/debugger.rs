@@ -7,6 +7,7 @@ pub mod utils;
 
 use crate::debugger::buffer::Buffer;
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{Read, Write};
@@ -42,6 +43,8 @@ pub enum Commands {
     GetPIDs,
 
     SetBreakpoint,
+
+    Log,
 }
 
 #[derive(Debug, PartialEq)]
@@ -152,12 +155,18 @@ pub struct PacketHeader {
     pub len: u32,
 }
 
+#[derive(Clone)] // Probably not the best way to do this specially if there is a lot of data
 pub struct Packet {
     pub header: PacketHeader,
     pub data: Buffer,
 }
 
-pub struct Debugger {
+#[async_trait]
+pub trait PacketHandler {
+    async fn handle(s: Arc<Mutex<Self>>, packet: &mut Packet);
+}
+
+pub struct Debugger<T: PacketHandler + Send + 'static> {
     pending_responses: Arc<Vec<Uuid>>,
     packet_map: Arc<Mutex<HashMap<Uuid, Packet>>>,
     queue: Arc<Mutex<Vec<Packet>>>,
@@ -165,19 +174,26 @@ pub struct Debugger {
     protocol_version: u32,
     last_query: Box<Option<MemoryInfo>>,
 
+    handler: Option<Arc<Mutex<T>>>,
+
     pub connected: bool,
 }
 
-impl Debugger {
-    pub fn new() -> Debugger {
+impl<T: PacketHandler + Send + 'static> Debugger<T> {
+    pub fn new() -> Debugger<T> {
         Debugger {
             pending_responses: Arc::new(Vec::new()),
             packet_map: Arc::new(Mutex::new(HashMap::new())),
             queue: Arc::new(Mutex::new(Vec::new())),
             protocol_version: 0,
             last_query: Box::new(None),
+            handler: None,
             connected: false,
         }
+    }
+
+    pub fn set_packet_handler(&mut self, handler: Arc<Mutex<T>>) {
+        self.handler = Some(handler);
     }
 
     pub async fn connect(&mut self, address: &str) -> Result<(), Box<dyn Error>> {
@@ -197,6 +213,7 @@ impl Debugger {
         let stream = stream.unwrap();
         let queue = Arc::clone(&self.queue);
         let packet_map = Arc::clone(&self.packet_map);
+        let handler = self.handler.clone();
 
         thread::spawn(move || {
             let mut stream = stream;
@@ -265,8 +282,17 @@ impl Debugger {
                         data: Buffer::from(data_buffer),
                     };
 
-                    p_map.insert(packet.header.uuid, packet);
+                    p_map.insert(packet.header.uuid, packet.clone());
                     drop(p_map);
+
+                    if let Some(handler) = handler.clone() {
+                        let s = Arc::clone(&handler);
+                        let mut packet = packet;
+
+                        tokio::spawn(async move {
+                            T::handle(s, &mut packet).await;
+                        });
+                    }
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(10));

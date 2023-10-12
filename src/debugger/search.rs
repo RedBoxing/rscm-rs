@@ -11,7 +11,7 @@ use crate::debugger::dump::DumpIndex;
 use super::{
     dump::{DumpRegionSupplier, MemoryDump},
     utils::{get_result, AnySizedNumber, DataType},
-    Debugger, MemoryInfo, Status,
+    Debugger, MemoryInfo, PacketHandler, Status,
 };
 
 const PAGE_SIZE: usize = 1024;
@@ -35,7 +35,7 @@ pub enum ConditionType {
 }
 
 #[derive(Clone)]
-pub struct SearchResult<F: Fn(&MemoryInfo) -> bool> {
+pub struct SearchResult {
     pub addresses: Vec<(u64, AnySizedNumber)>,
     pub regions: Vec<MemoryInfo>,
     pub data_type: DataType,
@@ -43,11 +43,11 @@ pub struct SearchResult<F: Fn(&MemoryInfo) -> bool> {
     pub start: u64,
     pub end: u64,
     pub curr: Option<Box<MemoryDump>>,
-    pub prev: Option<Rc<SearchResult<F>>>,
-    pub filter: Option<Rc<FnPredicate<F, MemoryInfo>>>,
+    pub prev: Option<Rc<SearchResult>>,
+    pub filter: Option<Rc<FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>>>,
 }
-impl<F: Fn(&MemoryInfo) -> bool> SearchResult<F> {
-    pub fn new() -> SearchResult<F> {
+impl SearchResult {
+    pub fn new() -> SearchResult {
         SearchResult {
             addresses: Vec::new(),
             regions: Vec::new(),
@@ -97,18 +97,18 @@ impl<F: Fn(&MemoryInfo) -> bool> SearchResult<F> {
     }
 }
 
-pub struct MemorySearcher<F: Fn(&MemoryInfo) -> bool> {
+pub struct MemorySearcher<T: PacketHandler + Send + 'static> {
     regions: Vec<MemoryInfo>,
-    debugger: Arc<Mutex<Box<Debugger>>>,
+    debugger: Arc<Mutex<Debugger<T>>>,
     pub data_type: DataType,
     pub search_type: SearchType,
     pub condition_type: ConditionType,
     pub know_value: AnySizedNumber,
-    pub prev_result: Option<Rc<SearchResult<F>>>,
+    pub prev_result: Option<Rc<SearchResult>>,
 }
 
-impl<F: Fn(&MemoryInfo) -> bool> MemorySearcher<F> {
-    pub fn new(debugger: Arc<Mutex<Box<Debugger>>>) -> MemorySearcher<F> {
+impl<T: PacketHandler + Send> MemorySearcher<T> {
+    pub fn new(debugger: Arc<Mutex<Debugger<T>>>) -> MemorySearcher<T> {
         MemorySearcher {
             regions: Vec::new(),
             debugger: debugger,
@@ -140,7 +140,7 @@ impl<F: Fn(&MemoryInfo) -> bool> MemorySearcher<F> {
         }
     }
 
-    pub fn search(&self, result: &mut SearchResult<F>) {
+    pub fn search(&self, result: &mut SearchResult) {
         if let Some(dump) = &result.curr {
             for idx in dump.indices.iter() {
                 let mut offset = 0 as usize;
@@ -176,7 +176,7 @@ impl<F: Fn(&MemoryInfo) -> bool> MemorySearcher<F> {
 
     async fn create_dump(
         &mut self,
-        supplier: &mut DumpRegionSupplier<F>,
+        supplier: &mut DumpRegionSupplier<T>,
     ) -> Option<Box<MemoryDump>> {
         let mut debugger = self.debugger.lock().expect("Failed to lock debugger");
 
@@ -249,8 +249,8 @@ impl<F: Fn(&MemoryInfo) -> bool> MemorySearcher<F> {
 
     pub async fn start_search(
         &mut self,
-        filter: FnPredicate<F, MemoryInfo>,
-    ) -> &Option<Rc<SearchResult<F>>> {
+        filter: FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>,
+    ) -> &Option<Rc<SearchResult>> {
         self.prev_result = None;
 
         let filter = Rc::new(filter);
@@ -273,7 +273,7 @@ impl<F: Fn(&MemoryInfo) -> bool> MemorySearcher<F> {
         &self.prev_result
     }
 
-    pub async fn continue_search(&mut self) -> &Option<Rc<SearchResult<F>>> {
+    pub async fn continue_search(&mut self) -> &Option<Rc<SearchResult>> {
         if self.prev_result.is_none() {
             return &None;
         }

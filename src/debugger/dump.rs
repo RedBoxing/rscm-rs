@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use super::{Buffer, Debugger};
+use super::{Buffer, Debugger, PacketHandler};
 use crate::debugger::MemoryInfo;
 
 use super::utils::{get_result, AnySizedNumber, DataType};
@@ -112,22 +112,22 @@ impl MemoryDump {
     }
 }
 
-pub struct DumpRegionSupplier<F: Fn(&MemoryInfo) -> bool> {
+pub struct DumpRegionSupplier<T: PacketHandler + Send + 'static> {
     start: u64,
     end: u64,
     size: usize,
     index: usize,
 
-    debugger: Arc<Mutex<Box<Debugger>>>,
+    debugger: Arc<Mutex<Debugger<T>>>,
     regions: Vec<MemoryInfo>,
-    filter: Rc<FnPredicate<F, MemoryInfo>>,
+    filter: Rc<FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>>,
 }
 
-impl<F: Fn(&MemoryInfo) -> bool> DumpRegionSupplier<F> {
+impl<T: PacketHandler + Send> DumpRegionSupplier<T> {
     pub fn new(
-        debugger: Arc<Mutex<Box<Debugger>>>,
-        filter: Rc<FnPredicate<F, MemoryInfo>>,
-    ) -> Option<DumpRegionSupplier<F>> {
+        debugger: Arc<Mutex<Debugger<T>>>,
+        filter: Rc<FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>>,
+    ) -> Option<DumpRegionSupplier<T>> {
         Some(DumpRegionSupplier {
             start: 0,
             end: 0,
