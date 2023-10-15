@@ -21,7 +21,7 @@ const VERSION_MAJOR: u32 = 1;
 const VERSION_MINOR: u32 = 0;
 const VERSION_PATCH: u32 = 0;
 
-#[derive(FromPrimitive, Debug, Clone)]
+#[derive(FromPrimitive, Debug, Clone, Copy)]
 pub enum Commands {
     None,
 
@@ -313,7 +313,7 @@ impl<T: PacketHandler + Send + 'static> Debugger<T> {
         loop {
             let mut packet_map = self.packet_map.lock().unwrap();
 
-            if start.elapsed().as_secs() > 30 {
+            if start.elapsed().as_secs() > 300 {
                 if packet_map.contains_key(&header.uuid) {
                     packet_map.remove(&header.uuid).unwrap();
                     drop(packet_map);

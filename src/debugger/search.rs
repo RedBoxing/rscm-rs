@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use humansize::{format_size, DECIMAL};
 use predicates::function::FnPredicate;
 use predicates::prelude::*;
 
@@ -174,27 +175,37 @@ impl<T: PacketHandler + Send> MemorySearcher<T> {
         }
     }
 
-    async fn create_dump(
-        &mut self,
-        supplier: &mut DumpRegionSupplier<T>,
-    ) -> Option<Box<MemoryDump>> {
+    async fn create_dump(&mut self, supplier: &mut DumpRegionSupplier) -> Option<Box<MemoryDump>> {
+        println!("Creating dump");
+
         let mut debugger = self.debugger.lock().expect("Failed to lock debugger");
 
         if get_result!(debugger.get_status().await) != Status::Paused {
+            println!("Pausing debugger");
             get_result!(debugger.pause().await);
         }
 
+        println!("Preparing dump");
+        supplier.reload(&mut debugger).await;
+
+        println!("Reloaded memory regions");
+
         let total_size = supplier.size().await;
-        let last_update = 0;
+        let mut last_update = std::time::Instant::now();
         let mut prev_read: u64 = 0;
         let mut avg = Rolling::new(10);
         let mut read: u64 = 0;
 
         let mut dump = MemoryDump::new();
 
+        println!("Getting TID");
+
         let title_id = get_result!(debugger.get_current_title_id().await);
+        println!("TID: {:016X}", title_id);
         dump.tid = title_id;
         dump.infos = get_result!(debugger.query_multi(0, 10000).await);
+
+        println!("Dumping memory");
 
         loop {
             let r = supplier.get().await;
@@ -208,36 +219,48 @@ impl<T: PacketHandler + Send> MemorySearcher<T> {
             let addr = r.addr;
             let start = std::time::Instant::now();
 
-            while size > 0 {
-                if start.elapsed() > std::time::Duration::from_millis(500) {
+            //println!("Dumping memory: {:016X} ({})", addr, size);
+
+            let mut remaining_size = size;
+            while remaining_size > 0 {
+                if last_update.elapsed() > std::time::Duration::from_millis(500) {
                     avg.add((read - prev_read) as f64);
                     prev_read = read;
-
-                    println!(
-                        "Dumping memory: {}% ({}/{}), {} KB/s",
-                        (read as f64 / total_size as f64) * 100.0,
-                        read,
-                        total_size,
-                        avg.get_average() / 1024.0
-                    );
+                    last_update = std::time::Instant::now();
                 }
 
-                let remaining_size = size;
-                while size > 0 {
-                    let len = remaining_size.min(2000000);
-                    let buf = get_result!(debugger.read_memory(addr, len as u32).await);
+                let len = remaining_size.min(2000000);
+                let buf = get_result!(
+                    debugger
+                        .read_memory(addr + (size - remaining_size), len as u32)
+                        .await
+                );
 
-                    dump.buffer.write(dump.buffer.pos(), &buf);
-                }
+                dump.buffer.write(dump.buffer.pos(), &buf);
+                remaining_size -= len;
+                read += len;
+
+                println!(
+                    "Dumping memory: {}% ({} / {}), {} KB/s",
+                    (read as f64 / total_size as f64) * 100.0,
+                    format_size(read, DECIMAL),
+                    format_size(total_size, DECIMAL),
+                    avg.get_average() * 2.0,
+                );
             }
+
+            /*   println!(
+                "Dumped memory: {:016X} ({}) in {:?}",
+                addr,
+                size,
+                start.elapsed()
+            );*/
 
             dump.indices.push(DumpIndex {
                 addr: addr,
                 file_pos: dump.buffer.pos() as u64,
                 size: size,
             });
-
-            read += size;
         }
 
         if get_result!(debugger.get_status().await) == Status::Paused {
@@ -251,6 +274,8 @@ impl<T: PacketHandler + Send> MemorySearcher<T> {
         &mut self,
         filter: FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>,
     ) -> &Option<Rc<SearchResult>> {
+        println!("Starting search");
+
         self.prev_result = None;
 
         let filter = Rc::new(filter);
@@ -260,7 +285,7 @@ impl<T: PacketHandler + Send> MemorySearcher<T> {
         result.search_type = self.search_type;
         result.filter = Some(filter.clone());
 
-        let supplier = DumpRegionSupplier::new(self.debugger.clone(), filter);
+        let supplier = DumpRegionSupplier::new(filter);
         if supplier.is_none() {
             return &None;
         }
@@ -292,7 +317,7 @@ impl<T: PacketHandler + Send> MemorySearcher<T> {
         result.prev = self.prev_result.clone();
         result.filter = Some(filter.clone());
 
-        let supplier = DumpRegionSupplier::new(self.debugger.clone(), filter);
+        let supplier = DumpRegionSupplier::new(filter);
         if supplier.is_none() {
             return &None;
         }
@@ -316,11 +341,16 @@ struct Rolling {
 
 impl Rolling {
     pub fn new(size: usize) -> Rolling {
+        let mut samples = Vec::new();
+        for i in 0..size {
+            samples.push(0.0);
+        }
+
         Rolling {
             size: size,
             total: 0.0,
             index: 0,
-            samples: Vec::new(),
+            samples: samples,
         }
     }
 

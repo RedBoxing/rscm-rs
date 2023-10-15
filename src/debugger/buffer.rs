@@ -108,7 +108,11 @@ impl Buffer {
 
     pub fn read_string(&mut self, size: usize) -> String {
         let buf = self.read(self.pos, size);
-        String::from_utf8_lossy(buf).to_string()
+        let res = String::from_utf8(buf.to_vec());
+        match res {
+            Ok(s) => s,
+            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+        }
     }
 
     pub fn read_compressed(&mut self, length: &mut u32) -> Buffer {
@@ -130,16 +134,13 @@ impl Buffer {
             let compressed_buffer = self.read_slice(self.pos, compressed_len as usize).to_vec();
             self.pos += compressed_len as usize;
 
-            let mut pos = 0;
             for i in (0..compressed_len).step_by(2) {
                 let value = compressed_buffer[i as usize];
                 let count = compressed_buffer[i as usize + 1];
 
-                for _ in pos..pos + count {
+                for _ in 0..count {
                     buffer.push(value);
                 }
-
-                pos += count;
             }
 
             Buffer::from(buffer)

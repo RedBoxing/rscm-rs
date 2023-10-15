@@ -21,11 +21,9 @@ struct MyPacketHandler {}
 #[async_trait]
 impl PacketHandler for MyPacketHandler {
     async fn handle(s: Arc<Mutex<Self>>, packet: &mut Packet) {
-        println!("Packet: {:?}", packet.header);
-
         match packet.header.command {
             Commands::Log => {
-                let len = packet.data.read_u32() as usize;
+                let len = packet.data.read_u64() as usize;
                 let s = packet.data.read_string(len);
 
                 println!("[DEBUG] {}", s);

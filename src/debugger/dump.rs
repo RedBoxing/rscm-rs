@@ -112,36 +112,32 @@ impl MemoryDump {
     }
 }
 
-pub struct DumpRegionSupplier<T: PacketHandler + Send + 'static> {
+pub struct DumpRegionSupplier {
     start: u64,
     end: u64,
     size: usize,
     index: usize,
 
-    debugger: Arc<Mutex<Debugger<T>>>,
     regions: Vec<MemoryInfo>,
     filter: Rc<FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>>,
 }
 
-impl<T: PacketHandler + Send> DumpRegionSupplier<T> {
+impl DumpRegionSupplier {
     pub fn new(
-        debugger: Arc<Mutex<Debugger<T>>>,
         filter: Rc<FnPredicate<Box<dyn Fn(&MemoryInfo) -> bool>, MemoryInfo>>,
-    ) -> Option<DumpRegionSupplier<T>> {
+    ) -> Option<DumpRegionSupplier> {
         Some(DumpRegionSupplier {
             start: 0,
             end: 0,
             size: 0,
             index: 0,
 
-            debugger: debugger,
             regions: Vec::new(),
             filter,
         })
     }
 
-    async fn reload(&mut self) {
-        let mut debugger = self.debugger.lock().expect("Failed to lock debugger");
+    pub async fn reload<T: PacketHandler + Send + 'static>(&mut self, debugger: &mut Debugger<T>) {
         self.regions = get_result!(debugger.query_multi(0, 10000).await);
 
         for info in self.regions.clone() {
@@ -165,23 +161,18 @@ impl<T: PacketHandler + Send> DumpRegionSupplier<T> {
     }
 
     pub async fn start(&mut self) -> u64 {
-        self.reload().await;
         self.start
     }
 
     pub async fn end(&mut self) -> u64 {
-        self.reload().await;
         self.end
     }
 
     pub async fn size(&mut self) -> usize {
-        self.reload().await;
         self.size
     }
 
     pub async fn get(&mut self) -> Option<MemoryInfo> {
-        self.reload().await;
-
         let mut current: MemoryInfo;
 
         loop {
