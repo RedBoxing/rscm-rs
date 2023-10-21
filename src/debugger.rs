@@ -267,15 +267,34 @@ impl<T: PacketHandler + Send + 'static> Debugger<T> {
                         len: u32::from_le_bytes(header_buffer[17..21].try_into().unwrap()),
                     };
 
+                    println!("Received packet: {:?}", header);
+
                     let mut data_buffer = vec![0; header.len as usize];
-                    let res = stream.read_exact(&mut data_buffer);
+                    /*  let res = stream.read_exact(&mut data_buffer);
                     if res.is_err() {
                         println!(
                             "An error occured while reading the data from the debugger: {:?}",
                             res
                         );
                         continue;
+                    }*/
+
+                    let mut remaining = header.len as usize;
+
+                    while (remaining > 0) {
+                        let res = stream.read(&mut data_buffer[header.len as usize - remaining..]);
+                        if res.is_err() {
+                            println!(
+                                "An error occured while reading the data from the debugger: {:?}",
+                                res
+                            );
+                            continue;
+                        }
+
+                        remaining -= res.unwrap();
                     }
+
+                    println!("Received data of size : {}", data_buffer.len());
 
                     let packet = Packet {
                         header: header,
@@ -659,14 +678,19 @@ impl<T: PacketHandler + Send + 'static> Debugger<T> {
             .await?;
 
         let mut infos = Vec::new();
+        let nbr = packet.data.read_u32();
 
-        for _ in 0..max {
+        println!("Querying {} memory regions", nbr);
+
+        for i in 0..nbr {
+            println!("Reading memory info {}", i);
             let info = read_info(&mut packet.data).await?;
-            infos.push(info.clone());
 
             if info.memory_type == MemoryType::Reserved {
                 break;
             }
+
+            infos.push(info.clone());
         }
         Ok(infos)
     }
@@ -774,20 +798,21 @@ impl<T: PacketHandler + Send + 'static> Debugger<T> {
 }
 
 async fn read_info(buffer: &mut Buffer) -> Result<MemoryInfo, Box<dyn Error>> {
-    let addr = buffer.read_u64();
-    let size = buffer.read_u64();
-    let flags = buffer.read_u32();
-    let perm = buffer.read_u32();
-
     let rc = DebuggerResult::value_of(buffer.read_u32());
     if rc.failed() {
         return Err(format!("Failed to read memory info: {:?}", rc).into());
     }
 
+    let addr = buffer.read_u64();
+    let size = buffer.read_u64();
+    let flags = buffer.read_u32();
+    let perm = buffer.read_u32();
+
     Ok(MemoryInfo {
         addr: addr,
         size: size,
-        memory_type: num::FromPrimitive::from_u32(flags).unwrap(),
+        memory_type: num::FromPrimitive::from_u32(flags)
+            .expect(format!("Invalid memory type {} !", flags).as_str()),
         perm: perm,
     })
 }
